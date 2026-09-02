@@ -1,0 +1,687 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+
+\renewcommand{\arraystretch}{1.12}
+
+\begin{document}
+
+\title{AI-Driven Multi-Objective Orchestration and\\
+Adaptive Scheduling for Noise-Aware\\
+Distributed Quantum Computing}
+
+\author{\IEEEauthorblockN{Author Name}
+\IEEEauthorblockA{\textit{Department / Institution} \\
+\textit{Affiliation}\\
+City, Country \\
+email@domain}
+}
+
+\maketitle
+
+\begin{abstract}
+Distributed quantum computing (DQC) couples several noisy intermediate-scale
+quantum (NISQ) processors so that circuits exceeding the capacity or fidelity of
+any single device can be executed cooperatively. Operating such a fleet requires
+an orchestration layer that decides which processor(s) run which circuit, in what
+order, subject to objectives that are simultaneously in tension: delivered
+fidelity, decoherence-bounded deadlines, throughput, and load balance. Classical
+schedulers optimize none of the quantum-specific objectives, and a naive
+fidelity-greedy policy ignores deadlines and collapses under contention. We
+present AMOS, an AI-driven, multi-objective orchestrator with an adaptive,
+noise-aware scheduling core. AMOS (i)~formulates placement as the maximization of
+a weighted multi-objective host score that \emph{satisfices} fidelity---rewarding
+tasks that clear a fidelity threshold rather than maximizing fidelity
+unconditionally---while jointly optimizing deadline feasibility, speed, and load;
+(ii)~orders tasks by least laxity to protect coherence budgets under overload;
+and (iii)~adapts online to calibration drift through a lightweight reliability
+estimator that derates processors whose realized fidelity falls below their
+datasheet. We evaluate AMOS in a discrete-event simulator of eight heterogeneous
+QPUs with decoherence, entanglement-mediated circuit distribution, and
+calibration drift. AMOS matches the best baseline when the fleet is uncontended
+and improves goodput by up to $\sim\!2\times$ under heavy overload while
+sustaining a $>\!99\%$ deadline-hit rate. A weight-sensitivity study shows the
+delivered-fidelity/goodput operating point is robust across the full
+satisfice-to-maximize range (variation $<\!1$\,pp), which justifies the
+satisficing default. An ablation shows the structured multi-objective policy,
+not the learner, drives the gain in stationary conditions; online adaptation
+earns its place only under non-stationarity, where it recovers a consistent
+fraction of the goodput lost after a device-degradation event. We report these
+findings---including the limits of the learning component---transparently and
+release the simulator for reproduction.
+\end{abstract}
+
+\begin{IEEEkeywords}
+distributed quantum computing, quantum orchestration, multi-objective scheduling,
+NISQ, decoherence, entanglement distribution, online adaptation, noise-aware
+scheduling
+\end{IEEEkeywords}
+
+% ===================================================================
+\section{Introduction}
+% ===================================================================
+Individual quantum processors are limited in qubit count and, more
+fundamentally, in the fidelity and coherence time available to a single
+device~\cite{barral2025review}. Distributed quantum computing (DQC) mitigates
+these limits by interconnecting multiple processors---within a chassis, a data
+center, or an eventual quantum network---so that a large circuit can be
+partitioned and executed across nodes using entanglement and classical
+communication~\cite{caleffi2024survey,chehimi2022qin}; distributed execution has
+recently been demonstrated across an optical network
+link~\cite{main2025optical}. As quantum cloud
+providers move toward multi-tenant operation over pools of heterogeneous
+devices~\cite{nguyen2024drlq}, they need an \emph{orchestration layer}: a
+control plane that admits a stream of quantum tasks (circuits) and maps them onto
+a heterogeneous QPU fleet over time.
+
+Orchestrating a quantum fleet is not classical job scheduling with new labels.
+Four properties make off-the-shelf policies inadequate:
+
+\begin{itemize}
+\item \textbf{Fidelity is a first-class outcome.} Without error correction, a
+NISQ execution returns a result whose usefulness is governed by process fidelity;
+two placements that both ``complete'' can differ from useful to worthless.
+\item \textbf{Deadlines are physical.} A circuit must finish within a
+coherence-limited budget; gate error and decoherence jointly cap the useful depth
+on a given device.
+\item \textbf{Distribution is not free.} Executing across $k$ nodes introduces
+non-local gates realized by entanglement (gate teleportation), each consuming an
+EPR pair and adding latency and a multiplicative fidelity
+penalty~\cite{piveteau2024knitting,du2024cutting}.
+\item \textbf{Devices are non-stationary.} Calibration drifts; a processor that
+looks best on its datasheet can be transiently or persistently
+unreliable~\cite{nguyen2025qfor}.
+\end{itemize}
+
+These properties place the orchestrator in a genuinely \emph{multi-objective}
+regime---delivered fidelity, deadline satisfaction, throughput, and load balance
+must be traded against one another---and in a \emph{non-stationary} one, where the
+datasheet the orchestrator relies on may be stale. Classical
+throughput/load-oriented schedulers ignore fidelity, while a fidelity-greedy
+policy ignores deadlines and contention and, as we show, collapses under load.
+
+\noindent\textbf{Contributions.}
+\begin{enumerate}
+\item We formulate noise-aware DQC orchestration over heterogeneous NISQ
+processors as multi-objective placement plus deadline-aware ordering, with a
+\emph{goodput} objective coupling a decoherence-bounded deadline and a fidelity
+threshold (Section~\ref{sec:model}).
+\item We propose \textbf{AMOS}, an AI-driven orchestrator whose scheduling core
+combines least-laxity ordering, a \emph{satisficing} multi-objective host score,
+and an online reliability estimator that adapts to calibration drift
+(Section~\ref{sec:method}).
+\item We build a discrete-event simulator modeling decoherence,
+entanglement-mediated distribution, and per-device drift, and evaluate AMOS
+against four baselines with a controlled ablation
+(Sections~\ref{sec:setup}--\ref{sec:results}).
+\item We report results honestly: AMOS improves goodput by up to $\sim\!2\times$
+under overload; its operating point is robust to the fidelity-weighting knob; and
+online learning is negligible under stationarity but consistently helpful under
+non-stationarity. We discuss the model's limitations explicitly
+(Section~\ref{sec:limitations}).
+\end{enumerate}
+
+% ===================================================================
+\section{Related Work}
+% ===================================================================
+\textbf{DQC foundations, surveys, and hardware.} The DQC landscape is mapped by
+recent surveys spanning single-QPU limits to high-performance quantum
+computing~\cite{caleffi2024survey,barral2025review}, reviews of recent
+progress~\cite{knorzer2025review}, and taxonomies of the path toward
+fault-tolerant DQC~\cite{larasati2025ftdqc}. The networked substrate is framed by
+the quantum-internet vision and its building
+blocks~\cite{chehimi2022qin,meddeb2025qinternet}. Crucially, DQC is no longer only
+theoretical: recent hardware demonstrations couple processors with real-time
+classical communication~\cite{carrera2024realtime} and even execute a distributed
+algorithm across an optical network link~\cite{main2025optical}, making the
+control-plane questions we study concrete.
+
+\textbf{Circuit cutting, knitting, and multi-core mapping.} Distribution is made
+concrete by circuit cutting/knitting, which decomposes a large circuit into
+subcircuits at a classical/entanglement overhead that grows with the number of
+cuts~\cite{piveteau2024knitting,du2024cutting}. Subsequent work tightens this
+overhead for wire cuts~\cite{harada2024wire}, multiple two-qubit
+unitaries~\cite{schmitt2025cutting}, and clustered simulation~\cite{harrow2025optimal}.
+On the compiler side, modular compilation frameworks~\cite{ferrari2023modular},
+qubit-assignment heuristics for multi-core
+architectures~\cite{escofet2023hungarian}, and learned circuit
+partitioning~\cite{pastor2024partitioning} target the \emph{intra-job} mapping.
+We adopt an abstracted form of the resulting distribution cost in our execution
+model and treat cutting/mapping as orthogonal to the \emph{across-job, over-time}
+orchestration problem.
+
+\textbf{Quantum cloud scheduling and orchestration.} Closest to our work, several
+recent efforts schedule quantum jobs across a fleet. Bahrani et
+al.~\cite{bahrani2024resource} study resource management and circuit scheduling
+for DQC interconnect networks, Chandra et al.~\cite{chandra2025netops} schedule
+the underlying network operations, Ferrari et al.~\cite{ferrari2024execution}
+address execution management of DQC jobs, and Du et al.~\cite{du2024cutting}
+co-optimize circuit cutting and scheduling with dynamic EPR pairs. Learning-based
+orchestrators are increasingly common: DRLQ places tasks with a deep Q-network to
+cut completion time~\cite{nguyen2024drlq}, QFOR adds fidelity awareness to a deep
+reinforcement-learning orchestrator~\cite{nguyen2025qfor}, and Luo et al.\ apply
+policy-gradient RL to adaptive job scheduling in quantum clouds~\cite{luo2025rl}.
+Reviews and simulation toolkits situate these
+efforts~\cite{nguyen2024review,nguyen2024iquantum}.
+
+\textbf{Positioning.} AMOS differs from the above in two respects. First, its
+scheduling core is a deliberately lightweight, interpretable multi-objective
+\emph{satisficing} policy with an online reliability derate---no deep network, no
+reward shaping---so its behavior is auditable and its weights map directly onto
+operator objectives. Second, we report the value of the learned component
+\emph{honestly}: an ablation shows it is negligible in stationary conditions and
+helps only, and modestly, under non-stationarity---a distinction the deep-RL
+orchestrators above do not isolate. To our knowledge, we are the first to couple a
+decoherence-bounded deadline and a fidelity threshold into a single goodput
+objective for across-fleet orchestration and to quantify when adaptation actually
+pays.
+
+% ===================================================================
+\section{System Model and Problem Formulation}
+\label{sec:model}
+% ===================================================================
+
+\subsection{Processors}
+The fleet is a set $\mathcal{Q}=\{q_1,\dots,q_M\}$ of heterogeneous QPUs. Each
+$q_j$ has qubit capacity $n_j$, nominal per-gate error $\varepsilon_j$, per-layer
+time $\tau_j$, coherence time $T_j$ (a $T_2$-like budget), and a
+calibration-instability factor $\delta_j$. The datasheet exposes
+$(n_j,\varepsilon_j,\tau_j,T_j)$ to the orchestrator; $\delta_j$ and
+moment-to-moment fluctuations are \emph{not} observable a priori.
+
+\subsection{Tasks}
+Tasks arrive as a stream. Task $i$ has arrival $a_i$, width $w_i$, depth $L_i$,
+gate count $g_i$, and absolute deadline $d_i$. Arrivals are Poisson with rate set
+by an offered-load parameter $\rho$ relative to aggregate fleet capability, so
+larger $\rho$ means more contention. Deadlines are $d_i=a_i+\sigma_i\hat{t}_i$ for
+a nominal estimate $\hat{t}_i$ and laxity $\sigma_i\in[2,6]$, modeling
+coherence-bounded urgency.
+
+\subsection{Execution and fidelity}
+For a monolithic placement ($w_i\le n_j$) on $q_j$, execution time is
+$t_{ij}=L_i\tau_j$ and the estimated process fidelity is
+\begin{equation}
+F_{ij} = \underbrace{(1-\varepsilon_j)^{g_i}}_{\text{gate errors}} \cdot
+\underbrace{\exp\!\left(-t_{ij}/T_j\right)}_{\text{decoherence}} .
+\label{eq:mono}
+\end{equation}
+When $w_i$ exceeds every free single device, the task is distributed over a set
+$S$ of $k=|S|$ processors, introducing $c_i=\lceil\beta L_i(k-1)\rceil$ non-local
+gates; each consumes an EPR pair of link fidelity $F_{\text{link}}$ and adds
+latency $t_{\text{epr}}$:
+\begin{align}
+t^{\text{dist}}_i &= L_i \max_{j\in S}\tau_j + c_i t_{\text{epr}},\\
+F^{\text{dist}}_i &= \Big(\textstyle\prod_{j\in S}(1-\varepsilon_j)^{g_i/k}\Big)
+e^{-t^{\text{dist}}_i/\min_{j\in S}T_j} F_{\text{link}}^{\,c_i}.
+\label{eq:dist}
+\end{align}
+Equations~\eqref{eq:mono}--\eqref{eq:dist} are intentionally first-order models
+(Section~\ref{sec:limitations}); they capture the qualitative couplings---error
+accumulation with gate count, decoherence with wall-clock time, and a compounding
+entanglement penalty with the degree of distribution.
+
+\subsection{Calibration drift}
+The \emph{realized} outcome differs from the datasheet. At execution,
+$\varepsilon_j$ and $1/T_j$ are each perturbed by an independent lognormal factor
+with log-standard-deviation $\sigma_{\text{drift}}\delta_j$, so unstable devices
+($\delta_j\!>\!1$) fluctuate more. A degradation event may persistently inflate a
+device's error rate mid-stream (Section~\ref{sec:setup}) \emph{without} updating
+the datasheet the orchestrator sees.
+
+\subsection{Multi-objective goodput objective}
+For each dispatched task we define objective components at placement: a fidelity
+margin $m_i=F_i-F_{\text{th}}$, a deadline slack $\ell_i=d_i-f_i$ (with realized
+finish $f_i$), execution speed, and incremental fleet load. A task \emph{succeeds}
+iff it clears both the deadline and the fidelity threshold:
+\begin{equation}
+\text{success}_i = \mathbb{1}\!\left[f_i \le d_i\right]\cdot
+\mathbb{1}\!\left[F_i \ge F_{\text{th}}\right].
+\end{equation}
+The orchestrator maximizes \emph{goodput}
+$G=\frac{1}{N}\sum_{i}\text{success}_i$, the scalar that couples the fidelity and
+deadline objectives; delivered fidelity, deadline-hit rate, and utilization are
+reported as the constituent objectives. Even the offline, static-fidelity version
+of this assignment is NP-hard (it generalizes deadline-constrained
+unrelated-machine scheduling), motivating an online heuristic.
+
+% ===================================================================
+\section{AMOS: Adaptive Multi-Objective Orchestrator}
+\label{sec:method}
+% ===================================================================
+AMOS runs at every orchestration event (arrival or completion). It maps a subset
+of pending tasks onto free processors through three mechanisms
+(Algorithm~\ref{alg:amos}).
+
+\subsection{Least-laxity ordering}
+Pending tasks are considered in increasing laxity
+$\ell_i=d_i-t_{\text{now}}-\min_j t_{ij}$, an earliest-deadline-first discipline
+that protects tasks at risk of exhausting their coherence budget. This directly
+serves the deadline objective and is the main reason AMOS resists overload where
+fidelity-greedy (arrival-ordered) policies do not.
+
+\subsection{Satisficing multi-objective placement}
+For a task and candidate host-set $h$ (a fitting single device, or one
+distributed set), AMOS scores
+\begin{equation}
+s(i,h)=w_F\,\Phi\!\big(\hat{F}_{ih}\,r_{ih}\big)+w_D\,\psi_{ih}
++w_T\frac{t^{\min}_i}{t_{ih}}-w_L\,\bar{u}_h,
+\label{eq:score}
+\end{equation}
+where $\hat{F}_{ih}$ is datasheet fidelity from
+\eqref{eq:mono}--\eqref{eq:dist}, $r_{ih}$ is a learned reliability derate
+(Section~\ref{sec:learn}), $\psi_{ih}\!\in\!\{-1,+1\}$ flags deadline
+feasibility, $t^{\min}_i$ is the fastest feasible time, and $\bar{u}_h$ is an
+exponential-moving load estimate. The fidelity mapping $\Phi$ blends a
+satisficing and a maximizing view via an orchestration knob
+$\lambda\!\in\![0,1]$:
+\begin{equation}
+\Phi(F)=(1-\lambda)\,\underbrace{\big(1+e^{-\gamma(F-F_{\text{th}})}\big)^{-1}}_{\text{satisfice}}
++\lambda\,\underbrace{F}_{\text{maximize}} .
+\label{eq:phi}
+\end{equation}
+At $\lambda\!=\!0$ (default) the fidelity term saturates once the threshold is
+safely cleared, so AMOS does not spend a scarce clean-but-slow device on a task
+that is already safe elsewhere; at $\lambda\!=\!1$ it maximizes delivered fidelity
+like a fidelity-greedy policy. A host-set whose best option cannot meet the
+deadline is skipped rather than wasted. The weight vector
+$(w_F,w_D,w_T,w_L)$ exposes the multi-objective trade-off to the operator; we use
+$(1.6,1.3,0.7,0.25)$ throughout and study sensitivity in
+Section~\ref{sec:results}.
+
+\subsection{Online reliability adaptation}
+\label{sec:learn}
+Datasheet fidelity $\hat{F}$ is systematically optimistic for unstable devices.
+AMOS maintains, per discretized task-state $x_i$ (width/depth buckets) and
+processor $j$, two exponential moving averages: realized success
+$\mathrm{rel}(x,j)$ and datasheet-predicted success $\mathrm{exp}(x,j)$. The
+derate is their smoothed ratio
+\begin{equation}
+r_{ij}=\min\!\Big(1.1,\ \tfrac{\mathrm{rel}(x_i,j)+\eta}{\mathrm{exp}(x_i,j)+\eta}\Big),
+\end{equation}
+driving $<\!1$ for devices that underperform their spec and $=\!1$ for unseen
+pairs (default trust). This is a lightweight, interpretable alternative to a deep
+policy; it needs no reward shaping and adapts within tens of executions. Setting
+$r_{ij}\!\equiv\!1$ gives the ablation \textbf{AMOS-S}.
+
+\begin{algorithm}[t]
+\caption{AMOS: one orchestration event}
+\label{alg:amos}
+\begin{algorithmic}[1]
+\State \textbf{Input:} time $t$, pending $\mathcal{P}$, free hosts $\mathcal{F}$
+\State sort $\mathcal{P}$ by ascending laxity $\ell_i$
+\For{each task $i \in \mathcal{P}$}
+  \State $\mathcal{C}\gets$ fitting single hosts in $\mathcal{F}$, else one
+         distributed set
+  \If{$\mathcal{C}=\varnothing$} \textbf{continue} \EndIf
+  \For{each $h \in \mathcal{C}$}
+     \State score $s(i,h)$ via \eqref{eq:score}--\eqref{eq:phi} with derate
+     $r_{ih}$
+  \EndFor
+  \State $h^\star\gets\arg\max_h s(i,h)$
+  \If{$t+t_{ih^\star}>d_i$} \textbf{continue} \Comment{skip hopeless}\EndIf
+  \State assign $i\!\to\!h^\star$; mark busy; update load EMA
+\EndFor
+\State \textbf{on completion of} $i$ \textbf{on} $h$:
+       update $\mathrm{rel},\mathrm{exp}$ for $(x_i,h)$
+\end{algorithmic}
+\end{algorithm}
+
+Each event costs $O(|\mathcal{P}|\,|\mathcal{F}|)$ score evaluations, negligible
+relative to circuit execution for a modest fleet.
+
+% ===================================================================
+\section{Experimental Setup}
+\label{sec:setup}
+% ===================================================================
+\textbf{Fleet.} We model $M{=}8$ heterogeneous QPUs spanning the NISQ design
+space: capacities $12$--$65$ qubits, per-gate errors $6\!\times\!10^{-4}$ to
+$9\!\times\!10^{-3}$, layer times $3.0$--$8.0\!\times\!10^{-7}$\,s, and $T_2$ from
+$7.0\!\times\!10^{-5}$ to $3.0\!\times\!10^{-4}$\,s. Two nominally attractive
+devices are made calibration-\emph{unstable} ($\delta_j{=}2.4$--$2.6$) and one
+clean device is made \emph{stable} ($\delta_j{=}0.6$), so datasheet ranking and
+realized reliability diverge. Fixed physics: $F_{\text{th}}{=}0.50$,
+$F_{\text{link}}{=}0.94$, $t_{\text{epr}}{=}2\,\mu$s, $\beta{=}0.12$,
+$\sigma_{\text{drift}}{=}0.35$.
+
+\textbf{Workload.} Widths are mostly $\le\!12$ with medium/large tails;
+$\sim\!12\%$ of tasks exceed the largest free single device and require
+distribution. Depths are $6$--$55$ layers, $g_i\!\approx\!0.5w_iL_i$. The
+feasibility ceiling (fraction runnable above threshold on the best device) is
+$\approx\!0.70$, and placement is decisive: $\approx\!69\%$ feasible on the
+cleaner half of the fleet versus $\approx\!47\%$ on the noisier half. This is a
+deliberately non-degenerate regime in which orchestration can matter
+(Section~\ref{sec:limitations}).
+
+\textbf{Baselines.} \emph{Random}; \emph{Round-Robin}; \emph{Least-Latency}
+(FCFS, fastest free device); \emph{Max-Fidelity} (FCFS, highest datasheet
+fidelity). We also report \textbf{AMOS-S} (no learning).
+
+\textbf{Protocol.} Each configuration uses $N{=}1500$ tasks and $15$ seeds; all
+policies see the \emph{same} workload and \emph{same} drift realization per seed
+(paired comparison). We sweep offered load $\rho\in\{0.4,\dots,2.0\}$ and report
+mean and s.d.\ of goodput, deadline-hit rate, mean delivered fidelity, and
+utilization. The full simulator and orchestrator code accompany the paper; all
+runs are seeded, so every figure and table reproduces exactly. Concretely,
+\texttt{final\_run.py} generates Figs.~\ref{fig:goodput},~\ref{fig:bars},
+and~\ref{fig:nonstat} with Tables~\ref{tab:metrics} and~\ref{tab:nonstat};
+\texttt{pareto\_run.py} with \texttt{make\_sens\_fig.py} generate
+Fig.~\ref{fig:sens} and Table~\ref{tab:sens}.
+
+% ===================================================================
+\section{Results}
+\label{sec:results}
+% ===================================================================
+
+\subsection{Goodput vs.\ offered load}
+Figure~\ref{fig:goodput} and Table~\ref{tab:metrics} summarize the sweep. When
+uncontended ($\rho{=}0.4$) deadlines rarely bind and fidelity-greedy placement is
+already near the feasibility ceiling: Max-Fidelity and AMOS-S tie at $0.63$
+goodput, AMOS within noise. AMOS earns its advantage as contention rises. At
+$\rho{=}1.5$, AMOS-S reaches $0.491$ versus $0.431$ for Max-Fidelity ($+13.9\%$
+relative, $+6.0$\,pp) and $0.450$ for Random. At heavy overload ($\rho{=}2.0$) the
+separation is stark: Max-Fidelity, Least-Latency, and Round-Robin all collapse to
+$\approx\!0.22$--$0.23$ as they miss deadlines and thrash slow devices, whereas
+AMOS sustains $0.450$---roughly a $2\times$ goodput improvement over
+fidelity-greedy and $+28\%$ over the best baseline.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_goodput.pdf}
+\caption{Goodput vs.\ offered load $\rho$ (mean $\pm$ s.d., 15 seeds). AMOS and
+its static ablation track the best baseline when uncontended and degrade
+gracefully under overload, where fidelity- and latency-greedy policies collapse.}
+\label{fig:goodput}
+\end{figure}
+
+\subsection{Where the gain comes from}
+Table~\ref{tab:metrics} isolates the mechanism. Under load, AMOS holds a
+deadline-hit rate of $\approx\!0.995$--$0.996$ while baselines fall to
+$0.937$--$0.967$ at $\rho{=}1.5$: least-laxity ordering does most of the work.
+Notably, AMOS's mean delivered fidelity is slightly \emph{lower} than
+Max-Fidelity's at $\rho{=}1.0$ ($0.468$ vs.\ $0.478$) even though its goodput is
+higher---the satisficing trade-off made explicit: AMOS accepts adequate
+(above-threshold) fidelity to meet more deadlines, and goodput, not raw fidelity,
+is the objective. Figure~\ref{fig:bars} shows the cross-objective picture at
+$\rho{=}1.5$.
+
+\begin{table}[t]
+\caption{Objective components at $\rho{=}1.0$ and $\rho{=}1.5$ (mean, 15 seeds).
+G=goodput, DL=deadline-hit, F=mean fidelity, U=utilization.}
+\label{tab:metrics}
+\centering
+\small
+\begin{tabular}{@{}l cccc@{}}
+\toprule
+\multicolumn{5}{c}{\textbf{Offered load $\rho=1.0$}}\\
+\midrule
+Policy & G & DL & F & U\\
+\midrule
+Random        & 0.480 & 0.986 & 0.459 & 0.824\\
+Round-Robin   & 0.485 & 0.986 & 0.460 & 0.826\\
+Least-Latency & 0.451 & 0.981 & 0.440 & 0.840\\
+Max-Fidelity  & 0.511 & 0.988 & \textbf{0.478} & 0.826\\
+AMOS-S        & \textbf{0.522} & \textbf{0.996} & 0.470 & 0.823\\
+AMOS          & 0.518 & \textbf{0.996} & 0.468 & 0.822\\
+\midrule
+\multicolumn{5}{c}{\textbf{Offered load $\rho=1.5$}}\\
+\midrule
+Policy & G & DL & F & U\\
+\midrule
+Random        & 0.450 & 0.967 & \textbf{0.475} & 0.982\\
+Round-Robin   & 0.428 & 0.943 & 0.467 & 0.991\\
+Least-Latency & 0.415 & 0.937 & 0.466 & 0.994\\
+Max-Fidelity  & 0.431 & 0.941 & 0.469 & \textbf{0.996}\\
+AMOS-S        & \textbf{0.491} & \textbf{0.995} & 0.474 & 0.991\\
+AMOS          & 0.489 & \textbf{0.995} & 0.473 & 0.986\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_metrics_bar.pdf}
+\caption{Cross-objective comparison at $\rho{=}1.5$. AMOS raises goodput and
+deadline-hit rate while holding fidelity and utilization comparable---trading
+surplus fidelity for schedule feasibility.}
+\label{fig:bars}
+\end{figure}
+
+\subsection{Multi-objective operating point: weight sensitivity}
+\label{sec:sens}
+The knob $\lambda$ in~\eqref{eq:phi} moves the fidelity objective from pure
+satisficing ($\lambda{=}0$) to pure maximization ($\lambda{=}1$).
+Figure~\ref{fig:sens} and Table~\ref{tab:sens} sweep it. The result is a
+\emph{robustness} finding rather than a wide Pareto front: across the entire
+range, mean delivered fidelity rises by at most $+0.006$ and goodput changes by at
+most $-0.005$ (both within seed noise). In this regime delivered fidelity of
+successful tasks is pinned by device physics and the binding deadline constraint,
+so weighting fidelity more heavily buys almost no delivered fidelity while
+slightly reducing goodput at high load. This justifies the satisficing default
+($\lambda{=}0$): it is at or near the best operating point, and the orchestrator's
+behavior is not brittle to this weight. Where routing has more redundancy the knob
+would gain leverage; we note this as a scope condition
+(Section~\ref{sec:limitations}).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_sensitivity.pdf}
+\caption{Operating-point sensitivity to the fidelity-weighting knob $\lambda$
+(satisfice $\to$ maximize; mean $\pm$ s.d., 15 seeds). Both goodput (left axis)
+and mean delivered fidelity (right axis) are essentially flat, so the operating
+point is robust and the satisficing default is well-justified.}
+\label{fig:sens}
+\end{figure}
+
+\begin{table}[t]
+\caption{Weight-sensitivity of AMOS to the fidelity knob $\lambda$ (mean,
+15 seeds). Variation is within seed noise.}
+\label{tab:sens}
+\centering
+\small
+\begin{tabular}{@{}l ccc ccc@{}}
+\toprule
+& \multicolumn{3}{c}{$\rho=1.0$} & \multicolumn{3}{c}{$\rho=1.5$}\\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+$\lambda$ & G & F & DL & G & F & DL\\
+\midrule
+0.0 & 0.518 & 0.468 & 0.996 & 0.489 & 0.473 & 0.995\\
+0.5 & 0.515 & 0.470 & 0.996 & 0.485 & 0.471 & 0.996\\
+1.0 & 0.513 & 0.474 & 0.996 & 0.490 & 0.474 & 0.996\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Ablation: what does online learning add?}
+Comparing AMOS and AMOS-S in Table~\ref{tab:metrics}, the two are statistically
+indistinguishable across the stationary sweep ($0.518$ vs.\ $0.522$ at
+$\rho{=}1.0$; $0.489$ vs.\ $0.491$ at $\rho{=}1.5$). We state this plainly:
+\emph{when devices are stationary, the datasheet fidelity model already captures
+the signal and online reliability learning adds no meaningful benefit over the
+well-designed static policy.} The structured multi-objective placement, not the
+learner, drives the advantage over baselines.
+
+\subsection{Non-stationarity: when adaptation helps}
+The learner's value appears when the datasheet goes stale. We repeat the
+$\rho{=}1.0$ experiment but, after $40\%$ of the stream resolves, inflate the
+realized error rate of the two devices datasheet-greedy policies most prefer by
+$10\times$ (a persistent degradation event; the datasheet is \emph{not} updated).
+Figure~\ref{fig:nonstat} plots windowed goodput and Table~\ref{tab:nonstat}
+reports pre/post means. All policies drop at the change point, but AMOS recovers
+the most: post-change goodput $0.406$ versus $0.395$ (AMOS-S) and $0.372$
+(Max-Fidelity), i.e.\ the online derate cuts the post-degradation loss from
+$0.152$ and $0.136$ to $0.122$. The effect is consistent but modest---a few
+percentage points---which is the honest magnitude a lightweight reliability
+estimator buys here.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_nonstat.pdf}
+\caption{Windowed goodput under a mid-stream device-degradation event (dotted
+line). Datasheet-greedy Max-Fidelity keeps routing to now-degraded devices; AMOS
+learns to derate them and recovers a larger share of goodput.}
+\label{fig:nonstat}
+\end{figure}
+
+\begin{table}[t]
+\caption{Goodput before/after the degradation event ($\rho{=}1.0$, 15 seeds).}
+\label{tab:nonstat}
+\centering
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Policy & Pre & Post & Drop\\
+\midrule
+Max-Fidelity & 0.524 & 0.372 & $-0.152$\\
+AMOS-S       & 0.531 & 0.395 & $-0.136$\\
+AMOS         & 0.527 & \textbf{0.406} & $\mathbf{-0.122}$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Summary of findings}
+(i)~A deadline- and fidelity-aware satisficing orchestrator substantially
+outperforms fidelity- and latency-greedy scheduling under contention, widening to
+$\sim\!2\times$ at overload and near-parity when uncontended.
+(ii)~Least-laxity ordering is the dominant contributor, sustaining $>\!99\%$
+deadline-hit rate. (iii)~The operating point is robust to the fidelity-weighting
+knob. (iv)~Online adaptation is negligible under stationarity but recovers a
+consistent fraction of goodput after device degradation.
+
+% ===================================================================
+\section{Limitations and Threats to Validity}
+\label{sec:limitations}
+% ===================================================================
+We are explicit about what this study does and does not establish.
+\emph{First}, results are from simulation, not hardware; the fidelity model
+\eqref{eq:mono}--\eqref{eq:dist} is a first-order abstraction omitting crosstalk,
+correlated/non-Markovian noise, native-gate compilation, connectivity/SWAP
+overhead, readout error, and realistic entanglement-distribution scheduling and
+buffering. Absolute numbers are relative comparisons within a common model, not
+device predictions. \emph{Second}, the workload regime was chosen so placement is
+consequential (a $\approx\!0.70$ feasibility ceiling); where nearly all tasks are
+trivially feasible or infeasible, orchestration matters less and gaps shrink.
+\emph{Third}, the flat weight-sensitivity (Section~\ref{sec:sens}) is specific to
+this regime: when most tasks have a single feasible host, the fidelity knob has
+little routing leverage; richer device redundancy would widen the trade-off.
+\emph{Fourth}, the learner is a tabular per-state/per-device estimator; richer
+function approximation might extract more from non-stationarity at the cost of the
+interpretability we relied on. \emph{Fifth}, we assume gang-scheduled distributed
+execution on simultaneously free nodes and do not model an entanglement-generation
+control plane; a joint circuit-cutting-plus-orchestration formulation is future
+work. These caveats bound the claims to: \emph{within a transparent, reproducible
+model, structured multi-objective orchestration is markedly more robust than
+greedy baselines, its operating point is stable, and cheap online adaptation adds
+a small, consistent benefit under drift.}
+
+% ===================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% ===================================================================
+We framed noise-aware DQC as an AI-driven, multi-objective orchestration problem
+and introduced AMOS, which orders by laxity, satisfices fidelity while optimizing
+deadline feasibility, speed, and load, and adapts to calibration drift via an
+online reliability derate. In a discrete-event simulator of a heterogeneous NISQ
+fleet with entanglement-mediated distribution, AMOS matched the best baseline when
+uncontended and improved goodput by up to $\sim\!2\times$ under overload, driven
+mainly by least-laxity ordering and satisficing placement; its operating point was
+robust to the fidelity-weighting knob, and online adaptation helped modestly and
+only under non-stationarity. Future work includes hardware-calibrated noise
+models, regimes with greater routing redundancy that expose a wider
+multi-objective front, a joint circuit-cutting/orchestration formulation, an
+explicit entanglement-distribution control plane, and richer learned reliability
+models evaluated against the interpretable baseline established here.
+
+% ===================================================================
+\begin{thebibliography}{00}
+\bibitem{caleffi2024survey} M.~Caleffi, M.~Amoretti, D.~Ferrari, J.~Illiano,
+A.~Manzalini, and A.~S.~Cacciapuoti, ``Distributed quantum computing: A survey,''
+\emph{Computer Networks}, vol.~254, p.~110672, 2024.
+\bibitem{barral2025review} D.~Barral \emph{et al.}, ``Review of distributed
+quantum computing: From single QPU to high performance quantum computing,''
+\emph{Computer Science Review}, vol.~57, p.~100747, 2025.
+\bibitem{chehimi2022qin} M.~Chehimi and W.~Saad, ``Physics-informed quantum
+communication networks: A vision toward the quantum internet,'' \emph{IEEE
+Network}, vol.~36, no.~5, pp.~32--38, 2022.
+\bibitem{piveteau2024knitting} C.~Piveteau and D.~Sutter, ``Circuit knitting with
+classical communication,'' \emph{IEEE Trans. Inf. Theory}, vol.~70, no.~4,
+pp.~2734--2745, 2024.
+\bibitem{du2024cutting} Z.~Du, W.~Zhang, W.~Wei, J.~Chen, T.~Han, Z.~Liang, and
+Y.~Mao, ``Efficient circuit cutting and scheduling in a multi-node quantum system
+with dynamic EPR pairs,'' \emph{arXiv preprint} arXiv:2412.18709, 2024.
+\bibitem{carrera2024realtime} A.~Carrera~Vazquez, C.~Tornow, D.~Rist\`e,
+S.~Woerner, M.~Takita, and D.~J.~Egger, ``Combining quantum processors with
+real-time classical communication,'' \emph{Nature}, vol.~636, p.~75, 2024.
+\bibitem{bahrani2024resource} S.~Bahrani, R.~D.~Oliveira, J.~M.~Parra-Ullauri,
+R.~Wang, and D.~Simeonidou, ``Resource management and circuit scheduling for
+distributed quantum computing interconnect networks,'' \emph{arXiv preprint}
+arXiv:2409.12675, 2024.
+\bibitem{nguyen2024drlq} H.~T.~Nguyen, M.~Usman, and R.~Buyya, ``DRLQ: A deep
+reinforcement learning-based task placement for quantum cloud computing,'' in
+\emph{Proc. 2024 IEEE 17th Int. Conf. on Cloud Computing (CLOUD)}, 2024,
+pp.~475--481.
+\bibitem{nguyen2025qfor} H.~T.~Nguyen, M.~Usman, and R.~Buyya, ``QFOR: A
+fidelity-aware orchestrator for quantum computing environments using deep
+reinforcement learning,'' \emph{ACM Trans. Quantum Computing}, 2025.
+\bibitem{luo2025rl} W.~Luo, J.~Zhao, T.~Zhan, and Q.~Guan, ``Adaptive job
+scheduling in quantum clouds using reinforcement learning,'' \emph{arXiv
+preprint} arXiv:2506.10889, 2025.
+\bibitem{chandra2025netops} N.~K.~Chandra \emph{et al.}, ``Network operations
+scheduling for distributed quantum computing,'' \emph{arXiv preprint}
+arXiv:2511.13687, 2025.
+\bibitem{main2025optical} D.~Main, P.~Drmota, D.~P.~Nadlinger, E.~M.~Ainley,
+A.~Agrawal, B.~C.~Nichol, R.~Srinivas, G.~Araneda, and D.~M.~Lucas,
+``Distributed quantum computing across an optical network link,'' \emph{Nature},
+vol.~638, no.~8050, pp.~383--388, 2025.
+\bibitem{larasati2025ftdqc} H.~T.~Larasati and B.-S.~Choi, ``Towards
+fault-tolerant distributed quantum computation (FT-DQC): Taxonomy, recent
+progress, and challenges,'' \emph{ICT Express}, vol.~11, no.~3, pp.~417--435,
+2025.
+\bibitem{knorzer2025review} J.~Kn\"orzer, X.~Liu, B.~F.~Schiffer, and J.~Tura,
+``Distributed quantum information processing: A review of recent progress,''
+\emph{arXiv preprint} arXiv:2510.15630, 2025.
+\bibitem{meddeb2025qinternet} A.~Meddeb, ``Quantum internet building blocks:
+State of research and development,'' \emph{Computer Networks}, vol.~261,
+p.~111151, 2025.
+\bibitem{harada2024wire} H.~Harada, K.~Wada, and N.~Yamamoto, ``Doubly optimal
+parallel wire cutting without ancilla qubits,'' \emph{PRX Quantum}, vol.~5,
+no.~4, p.~040308, 2024.
+\bibitem{schmitt2025cutting} L.~Schmitt, C.~Piveteau, and D.~Sutter, ``Cutting
+circuits with multiple two-qubit unitaries,'' \emph{Quantum}, vol.~9, p.~1634,
+2025.
+\bibitem{harrow2025optimal} A.~W.~Harrow and A.~Lowe, ``Optimal quantum circuit
+cuts with application to clustered Hamiltonian simulation,'' \emph{PRX Quantum},
+vol.~6, p.~010316, 2025.
+\bibitem{ferrari2023modular} D.~Ferrari, S.~Carretta, and M.~Amoretti, ``A
+modular quantum compilation framework for distributed quantum computing,''
+\emph{IEEE Trans. Quantum Eng.}, vol.~4, pp.~1--13, 2023.
+\bibitem{escofet2023hungarian} P.~Escofet, A.~Ovide, C.~G.~Almud\'ever,
+E.~Alarc\'on, and S.~Abadal, ``Hungarian qubit assignment for optimized mapping
+of quantum circuits on multi-core architectures,'' \emph{IEEE Comput. Archit.
+Lett.}, vol.~22, no.~2, pp.~161--164, 2023.
+\bibitem{pastor2024partitioning} A.~Pastor, P.~Escofet, S.~B.~Rached,
+E.~Alarc\'on, P.~Barlet-Ros, and S.~Abadal, ``Circuit partitioning for multi-core
+quantum architectures with deep reinforcement learning,'' \emph{arXiv preprint}
+arXiv:2401.17976, 2024.
+\bibitem{ferrari2024execution} D.~Ferrari, M.~Bandini, and M.~Amoretti,
+``Execution management of distributed quantum computing jobs,'' in \emph{Proc.
+IEEE Int. Conf. Quantum Computing and Engineering (QCE)}, 2024, pp.~150--154.
+\bibitem{nguyen2024review} H.~T.~Nguyen, P.~Krishnan, D.~Krishnaswamy, M.~Usman,
+and R.~Buyya, ``Quantum cloud computing: A review, open problems, and future
+directions,'' \emph{arXiv preprint} arXiv:2404.11420, 2024.
+\bibitem{nguyen2024iquantum} H.~T.~Nguyen, M.~Usman, and R.~Buyya, ``iQuantum: A
+toolkit for modeling and simulation of quantum computing environments,''
+\emph{Softw. Pract. Exper.}, vol.~54, no.~6, pp.~1141--1171, 2024.
+\end{thebibliography}
+
+\end{document}
